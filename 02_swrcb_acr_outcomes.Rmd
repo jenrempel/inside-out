@@ -1,0 +1,623 @@
+---
+title: "swrcb_acr_outcomes"
+author: Jenny Rempel
+output: html_document
+---
+
+# Script overview: 
+This script cleans CA State Water Resources Control Board (SWRCB) Annual Compliance Report (ACR) data and joins it to key covariates from the US EPA's SDWA SDWIS dataset.
+
+# Inputs:
+- 2020-2024 ACR data, all downloaded 8/26/25 from the CA SWRCB Division of Drinking Water (DDW) (via https://www.waterboards.ca.gov/drinking_water/certlic/drinkingwater/Publications.html):
+    - "raw_data/ddw_acrs/acr_2020_dataset.xlsx"
+    - "raw_data/ddw_acrs/acr-2021-dataset.xlsx"
+    - "raw_data/ddw_acrs/acr-2022-dataset.xlsx"
+    - "raw_data/ddw_acrs/acr-2023-dataset.xlsx"
+    - "raw_data/ddw_acrs/acr-2024-dataset.xlsx"
+    
+- “raw_data/SDWA_latest_downloads/SDWA_PUB_WATER_SYSTEMS.csv" (Safe Drinking Water Act (SDWA) public water system file downloaded 1/17/25 from USEPA SDWIS/ECHO: https://echo.epa.gov/files/echodownloads/SDWA_latest_downloads.zip downloaded from https://echo.epa.gov/tools/data-downloads; data download summary: https://echo.epa.gov/tools/data-downloads/sdwa-download-summary; date data extracted: 1/11/2025 noted on https://echo.epa.gov/resources/echo-data/about-the-data)
+
+- "processed_data/universe_pwsids.rds" (created in script 01)
+
+# Key outputs:
+- "outputs/acr_df_for_analysis.csv" (used in subsequent scripts)
+
+# Requires:
+- pacman, tidyverse, janitor, sf, lubridate, mapview, readxl
+
+
+# 0. setup (always run these)
+
+```{r}
+# Install pacman if not present
+if (!requireNamespace("pacman", quietly = TRUE)) install.packages("pacman")
+
+# Check, install missing, and load all packages in one call
+pacman::p_load(tidyverse, # general purpose
+               janitor,#  tidying dataframes
+               sf, # spatial work
+               lubridate, # dates
+               mapview,# mapping
+               readxl) # read excel files
+
+options(tigris_use_cache = TRUE)
+```
+
+```{r useful functions}
+
+# %notin%: operator that returns the negation of %in%
+`%notin%` <- Negate(`%in%`)
+
+# count_df_na: takes a dataframe and returns counts of NA values in each column
+count_df_na <- function(df) {
+  sapply(df, function(x) sum(is.na(x)))
+}
+
+# view_flat: quick look at sf objects w/o geometry
+view_flat <- function(df) {
+  st_drop_geometry(df) %>% 
+    View()
+}
+
+```
+
+
+# step 3. using swrcb acr data, create cleaned dataset of 2020-2024 violations
+
+## 3a. load and clean acr data
+```{r load and clean acr data}
+################################################################################
+################################################################################
+### load
+
+# 1 tab
+acr20_orig <- read_xlsx("raw_data/ddw_acrs/acr_2020_dataset.xlsx")
+
+# 2 tabs - both relevant
+acr21_orig_fed_viols <- read_xlsx("raw_data/ddw_acrs/acr-2021-dataset.xlsx",
+                                  sheet = "acr_2021_Federal_Violations")
+acr21_orig_state_viols <- read_xlsx("raw_data/ddw_acrs/acr-2021-dataset.xlsx",
+                                  sheet = "acr_2021_State_Violations")
+
+# 2 tabs - only need violations tab
+acr22_orig <- read_xlsx("raw_data/ddw_acrs/acr-2022-dataset.xlsx",
+                        sheet = "acr_2022_violations")
+
+# 1 tab
+acr23_orig <- read_xlsx("raw_data/ddw_acrs/acr-2023-dataset.xlsx")
+
+# 2 tabs - group and single
+acr24_orig_group <- read_xlsx("raw_data/ddw_acrs/acr-2024-dataset.xlsx", 
+                               sheet = "2024_group_violations")
+acr24_orig_single <- read_xlsx("raw_data/ddw_acrs/acr-2024-dataset.xlsx", 
+                               sheet = "2024_single_violations")
+  
+
+################################################################################
+################################################################################
+### clean
+
+# clean names for each
+acr20cl <- acr20_orig %>% 
+  janitor::clean_names()
+
+acr21_fed_viols_cl <- acr21_orig_fed_viols %>% 
+  janitor::clean_names()
+
+acr21_state_viols_cl <- acr21_orig_state_viols %>% 
+  janitor::clean_names()
+
+acr22cl <- acr22_orig %>% 
+  janitor::clean_names()
+
+acr23cl <- acr23_orig %>% 
+  janitor::clean_names()
+
+acr24_group_cl <- acr24_orig_group %>% 
+  janitor::clean_names()
+
+acr24_single_cl <- acr24_orig_single %>% 
+  janitor::clean_names()
+
+################################################################################
+# 2020
+
+# rename for consistency: pwsid, viol_type, viol_name, contaminant, 
+acr20 <- acr20cl %>% 
+  rename(pwsid = pws_number, 
+         viol_type = category_code, 
+         viol_subtype = name,
+         contaminant = analyte) %>% 
+  mutate(year = "2020") %>% 
+  select(pwsid, viol_type, viol_subtype, contaminant, year) %>% 
+  filter(viol_type %in% c(
+    # health-based
+    "MCL", "TT", 
+    # monitoring and reporting
+    "MON", # major and minor
+    "PN", # notification; only 1 PN violation for a state notification rule in 2020
+    "RPT")) # eg. failure to complete annual report, 
+            # state reporting requirement violations, ccr report,
+            # but 1 notification re: e coli
+                          
+# checked each viol_type
+acr20 %>% filter(viol_type == "MCL") %>% count(viol_subtype) %>% arrange(desc(n)) 
+  # note: MCL includes secondary MCLs
+
+
+################################################################################
+# 2021
+
+# rename for consistency: pwsid, viol_type, viol_name, contaminant, 
+acr21_fed <- acr21_fed_viols_cl %>% 
+  rename(pwsid = number0, 
+         viol_type = category_code, 
+         viol_subtype = name,
+         contaminant = analyte) %>% 
+  mutate(year = "2021") %>% 
+  select(pwsid, viol_type, viol_subtype, contaminant, year,
+         tmnviol_is_number) %>% 
+  filter(viol_type %in% c(
+    # health-based
+    "MCL", "TT", 
+    # monitoring and reporting
+    "MON", # major and minor
+    "PN", # public notice rule linked to violation; state notification
+    "RPT")) # eg. failure to complete annual report, 
+            # state reporting requirement violations, ccr report,
+            # but 1 notification re: e coli
+
+# checked each viol_type
+acr21_fed %>% filter(viol_type == "MCL") %>% count(viol_subtype) %>% arrange(desc(n)) 
+  # no 2ndary MCLs listed here
+
+# rename for consistency: pwsid, viol_type, viol_name, contaminant, 
+acr21_state <- acr21_state_viols_cl %>% 
+  rename(pwsid = number0, 
+         viol_type = category_code, 
+         viol_subtype = name,
+         contaminant = analyte) %>% 
+  mutate(year = "2021") %>% 
+  select(pwsid, viol_type, viol_subtype, contaminant, year,
+         tmnviol_is_number) %>% 
+  filter(viol_type %in% c(
+    # health-based
+    "MCL", "TT", 
+    # monitoring and reporting
+    "MON", # major and minor
+    "PN", # none this year
+    "RPT")) # eg. failure to complete annual report, 
+            # state reporting requirement violations, ccr report,
+            # but 1 notification re: e coli
+
+# checked each viol_type
+acr21_state %>% filter(viol_type == "MCL") %>% count(viol_subtype) %>% arrange(desc(n)) 
+    # note: MCL includes secondary MCLs here
+
+# both state and federal have a "state primary mcl - not cr6" subtype, so i'll check those to make sure they're not duplicated entries
+#acr21_fed %>% filter(viol_type == "MCL" & viol_subtype == "STATE PRIMARY MCL VIOL - NOT CR6") %>% view()
+
+#acr21_state %>% filter(viol_type == "MCL" & viol_subtype == "STATE PRIMARY MCL VIOL - NOT CR6") %>% view() 
+  # from manual inspection, these are not duplicate entries; there are different PWSIDs on each list
+
+# join state and federal for 2021
+names(acr21_state) == names(acr21_fed) # true
+
+acr21_prep <- acr21_state %>% 
+  bind_rows(acr21_fed)
+ 
+# double check that they're all unique, using tmnviol_is_number
+nrow(acr21_prep) # 2972
+length(unique(acr21_prep$tmnviol_is_number)) # 2815
+acr21_chk_tmnviol <- acr21_prep %>% 
+  group_by(tmnviol_is_number) %>% 
+  filter(tmnviol_is_number != "") %>% 
+  add_count() %>% 
+  filter(n>1) 
+
+#view(acr21_chk_tmnviol)
+nrow(acr21_chk_tmnviol) # 246
+max(acr21_chk_tmnviol$n) # 2
+  # 246/2 = 123 violations with the same tmnviol_is_number
+nrow(acr21_prep) # 2972 
+123/(2972-123) # 4%
+
+# remove column that's no longer needed
+acr21 <- acr21_prep %>% 
+  select(-tmnviol_is_number)
+  
+
+################################################################################
+# 2022
+
+# rename for consistency: pwsid, viol_type, viol_name, contaminant, 
+acr22 <- acr22cl %>% 
+  rename(pwsid = number0, 
+         viol_type = category_code, 
+         viol_subtype = name,
+         contaminant = analytegroup_nm) %>% 
+  mutate(year = "2022") %>% 
+  select(pwsid, viol_type, viol_subtype, contaminant, year) %>% 
+  filter(viol_type %in% c(
+    # health-based
+    "MCL", "TT", 
+    # monitoring and reporting
+    "MON", # major and minor
+    "PN", # public notice rule
+    "RPT")) # eg. failure to complete annual report, 
+            # state reporting requirement violations, ccr report,
+            # but 1 notification re: e coli
+                          
+# checked each viol_type
+acr22 %>% filter(viol_type == "MCL") %>% count(viol_subtype) %>% arrange(desc(n)) %>% 
+  print(n = nrow(.))
+  # note: MCL includes secondary MCLs 
+
+
+
+################################################################################
+# 2023
+
+# rename for consistency: pwsid, viol_type, viol_name, contaminant, 
+acr23 <- acr23cl %>% 
+  rename(viol_type = viol_category, 
+         viol_subtype = violation_type_name,
+         contaminant = analyte_name) %>% 
+  mutate(year = "2023") %>% 
+  select(pwsid, viol_type, viol_subtype, contaminant, year) %>% 
+  filter(viol_type %in% c(
+    # health-based
+    "MCL", "TT", 
+    # monitoring and reporting
+    "MON", # major and minor
+    "PN", # public notice rule
+    "RPT")) # eg. failure to complete annual report, 
+            # state reporting requirement violations, ccr report,
+            # but 1 notification re: e coli
+                          
+# checked each viol_type
+acr23 %>% filter(viol_type == "MCL") %>% count(viol_subtype) %>% arrange(desc(n)) %>% 
+  print(n = nrow(.))
+  # note: MCL includes secondary MCLs 
+
+# first time i've seen a "POU/POE MCL" as the "rule type" - investigate
+#acr23 %>% filter(viol_type == "MCL" & viol_subtype == "POU/POE MCL") %>% view()
+  # we will include this
+
+################################################################################
+# 2024
+
+## group tab
+# rename for consistency: pwsid, viol_type, viol_name, contaminant, 
+acr24_group <- acr24_group_cl %>% 
+  rename(viol_type = viol_category, 
+         viol_subtype = violation_type_name,
+         contaminant = analyte_name) %>% 
+  mutate(year = "2024") %>% 
+  select(pwsid, viol_type, viol_subtype, contaminant, year) %>% 
+  filter(viol_type %in% c(
+    # health-based
+    "MCL", "TT", 
+    # monitoring and reporting
+    "MON", # major and minor
+    "PN", # public notice rule
+    "RPT")) # eg. failure to complete annual report, 
+            # state reporting requirement violations, ccr report,
+            # but 1 notification re: e coli
+                          
+# checked each viol_type
+acr24_group %>% filter(viol_type == "MON") %>% count(viol_subtype) %>% arrange(desc(n)) %>% 
+  print(n = nrow(.))
+  # all monitoring violations
+
+## single tab
+# rename for consistency: pwsid, viol_type, viol_name, contaminant, 
+acr24_single <- acr24_single_cl %>% 
+  rename(viol_type = viol_category, 
+         viol_subtype = violation_type_name,
+         contaminant = analyte_name) %>% 
+  mutate(year = "2024") %>% 
+  select(pwsid, viol_type, viol_subtype, contaminant, year) %>% 
+  filter(viol_type %in% c(
+    # health-based
+    "MCL", "TT", 
+    # monitoring and reporting
+    "MON", # major and minor
+    "PN", # public notice rule
+    "RPT")) # eg. failure to complete annual report, 
+            # state reporting requirement violations, ccr report,
+            # but 1 notification re: e coli
+                          
+# checked each viol_type
+acr24_single %>% filter(viol_type == "MCL") %>% count(viol_subtype) %>% arrange(desc(n)) %>% 
+  print(n = nrow(.))
+  # includes secondary MCL and POU/POE MCL
+
+# combine those tabs
+names(acr24_group) == names(acr24_single)
+
+acr24 <- acr24_group %>% 
+  bind_rows(acr24_single)
+
+################################################################################
+### combine all years
+
+# confirm same names
+names(acr20) == names(acr21)
+names(acr20) == names(acr22)
+names(acr20) == names(acr23)
+names(acr20) == names(acr24)
+
+# bind rows
+all_acrs <- bind_rows(list(acr20, acr21, acr22, acr23, acr24))
+
+nrow(all_acrs) == nrow(acr20) + nrow(acr21) + nrow(acr22) + nrow(acr23) + 
+  nrow(acr24) 
+
+################################################################################
+################################################################################
+### save
+saveRDS(all_acrs, "processed_data/all_acrs.rds")
+
+```
+
+
+## 3b. create annual violation counts by system
+```{r}
+
+################################################################################
+################################################################################
+### load data
+
+# universe of pwsids (based on usepa sdwis)
+universe_pwsids <- readRDS("processed_data/universe_pwsids.rds")
+length(universe_pwsids) # 4301
+
+# acr data (swrcb ddw)
+all_acrs <- readRDS("processed_data/all_acrs.rds")
+dim(all_acrs) # 14938     5
+
+# usepa sdwis (echo data)
+pws_list <- read_csv("raw_data/SDWA_latest_downloads/SDWA_PUB_WATER_SYSTEMS.csv")
+  # note: one warning message that is not relevant for our purposes
+nrow(pws_list) # 431754
+
+
+################################################################################
+# health-based (MCL and TT)
+health <- all_acrs %>% 
+  filter(viol_type %in% c("TT", "MCL"))
+
+nrow(health) # 6681
+
+# count per pwsid per year
+health_per_pwsid_per_year <- health %>% 
+  group_by(pwsid, year) %>%
+  mutate(annual_health_n = n()) %>% 
+  ungroup() %>% 
+  distinct(pwsid, year, annual_health_n)
+summary(health_per_pwsid_per_year$annual_health_n)
+
+# count per pwsid per year, tt only
+health_per_year_tt_count <- health %>% 
+  filter(viol_type == "TT") %>% 
+  group_by(pwsid, year) %>%
+  mutate(annual_tt = n()) %>% 
+  ungroup() %>% 
+  distinct(pwsid, year, annual_tt)
+summary(health_per_year_tt_count$annual_tt)
+
+# count per pwsid per year, mcl only
+health_per_year_mcl_count <- health %>% 
+  filter(viol_type == "MCL") %>% 
+  group_by(pwsid, year) %>%
+  mutate(annual_mcl = n()) %>% 
+  ungroup() %>% 
+  distinct(pwsid, year, annual_mcl)
+summary(health_per_year_mcl_count$annual_mcl)
+
+# count per pwsid per year, mcl only, w/o 2ndary mcl
+health_per_year_count_no_2ndary_mcl <- health %>% 
+  filter(viol_type %in% c("MCL", "TT")) %>% 
+  filter(viol_subtype != "§64449 SECONDARY MCL") %>% 
+  group_by(pwsid, year) %>%
+  mutate(annual_health_no_2ndary = n()) %>% 
+  ungroup() %>% 
+  distinct(pwsid, year, annual_health_no_2ndary)
+summary(health_per_year_count_no_2ndary_mcl$annual_health_no_2ndary)
+
+# count per pwsid per year, tt only w/o lsl
+health_per_year_count_no_2ndary_or_lsl_inventory <- health %>% 
+  filter(viol_type %in% c("MCL", "TT")) %>% 
+  filter(viol_subtype != "§64449 SECONDARY MCL") %>% 
+  filter(viol_subtype != "LSL INVENTORY-INITIAL") %>% 
+  group_by(pwsid, year) %>%
+  mutate(annual_health_no_2ndary_or_lsl_inventory = n()) %>% 
+  ungroup() %>% 
+  distinct(pwsid, year, annual_health_no_2ndary_or_lsl_inventory)
+summary(health_per_year_count_no_2ndary_or_lsl_inventory$annual_health_no_2ndary_or_lsl_inventory)
+
+# join
+health_data <- health_per_pwsid_per_year %>% 
+  left_join(health_per_year_tt_count, by = c("pwsid", "year")) %>%
+  left_join(health_per_year_mcl_count, by = c("pwsid", "year")) %>% 
+  left_join(health_per_year_count_no_2ndary_mcl, by = c("pwsid", "year")) %>% 
+  left_join(health_per_year_count_no_2ndary_or_lsl_inventory, by = c("pwsid", "year"))
+
+
+
+################################################################################
+# monitoring/reporting (MON, PN, RPT)
+mr <- all_acrs %>% 
+  filter(viol_type %in% c("MON", "PN", "RPT"))
+
+nrow(mr) # 8257
+
+# count per pwsid per year
+mr_per_pwsid_per_year <- mr %>% 
+  group_by(pwsid, year) %>%
+  mutate(annual_mr_n = n()) %>% 
+  ungroup() %>% 
+  distinct(pwsid, year, annual_mr_n)
+summary(mr_per_pwsid_per_year$annual_mr_n)
+
+# count per pwsid per year, MON only
+mr_per_year_mon_count <- mr %>% 
+  filter(viol_type == "MON") %>% 
+  group_by(pwsid, year) %>%
+  mutate(annual_mon = n()) %>% 
+  ungroup() %>% 
+  distinct(pwsid, year, annual_mon)
+summary(mr_per_year_mon_count$annual_mon)
+
+# count per pwsid per year, PN only
+mr_per_year_pn_count <- mr %>% 
+  filter(viol_type == "PN") %>% 
+  group_by(pwsid, year) %>%
+  mutate(annual_pn = n()) %>% 
+  ungroup() %>% 
+  distinct(pwsid, year, annual_pn)
+summary(mr_per_year_pn_count$annual_pn)
+
+# count per pwsid per year, RPT only
+mr_per_year_rpt_count <- mr %>% 
+  filter(viol_type == "RPT") %>% 
+  group_by(pwsid, year) %>%
+  mutate(annual_rpt = n()) %>% 
+  ungroup() %>% 
+  distinct(pwsid, year, annual_rpt)
+summary(mr_per_year_rpt_count$annual_rpt)
+
+# join
+mr_data <- mr_per_pwsid_per_year %>% 
+  left_join(mr_per_year_mon_count, by = c("pwsid", "year")) %>%
+  left_join(mr_per_year_pn_count, by = c("pwsid", "year")) %>% 
+  left_join(mr_per_year_rpt_count, by = c("pwsid", "year"))
+
+################################################################################
+# combine 
+all_viols_by_pwsid_by_year <- health_data %>% 
+  full_join(mr_data, by = c("pwsid", "year"))
+
+# list all PWSs in study over time frame
+universe_pwsid_years <- universe_pwsids %>% 
+  crossing(c(2020:2024)) 
+colnames(universe_pwsid_years) <- c("pwsid","year")
+universe_pwsid_years <- universe_pwsid_years %>% 
+  mutate(year = as.character(year))
+
+# join violation data to that otherwise empty dataframe
+all_pwsids_viols_per_year <- universe_pwsid_years %>% 
+  left_join(all_viols_by_pwsid_by_year, by = c("pwsid", "year")) %>% 
+  # set NAs to 0
+  mutate(across(annual_health_n:annual_rpt, 
+                ~ ifelse(is.na(.), 0, .)))
+
+################################################################################
+# create measures that look over the entire 5-year time period
+
+# create 5-year count & binary variables for health and monitoring violations
+five_year_measures <- all_pwsids_viols_per_year %>% 
+  group_by(pwsid) %>% 
+  # create 5-year count variables 
+  summarize(health_5yr_count = sum(annual_health_n),
+            health_5yr_count_no2ndary_mcl = sum(annual_health_no_2ndary),
+            health_5yr_count_no_2ndary_or_lsl = sum(annual_health_no_2ndary_or_lsl_inventory),
+            mr_5yr_count = sum(annual_mr_n),
+            mon_only_5yr_count = sum(annual_mon)) %>% 
+  # create binary variables
+  mutate(health_5yr_binary = as.numeric(ifelse(health_5yr_count == 0,
+                                    "0", "1")),
+         health_5yr_no2ndary_mcl_binary = as.numeric(ifelse(health_5yr_count_no2ndary_mcl == 0,
+                                    "0", "1")),
+         health_5yr_no2ndary_or_lsl_binary = as.numeric(ifelse(health_5yr_count_no_2ndary_or_lsl == 0,
+                                    "0", "1")),
+         mr_5yr_binary = as.numeric(ifelse(mr_5yr_count == 0,
+                                    "0", "1")),
+         mon_only_5yr_binary = as.numeric(ifelse(mon_only_5yr_count == 0,
+                                    "0", "1")))
+
+summary(five_year_measures)
+
+################################################################################
+# add covariates from USEPA SDWA data (ECHO - SDWIS)
+
+# clean usepa sdwis echo data
+pws_list_cl <- pws_list %>% 
+  janitor::clean_names()
+
+# add covariates from usepa sdwis echo data
+five_year_measures_w_all_covariates <- five_year_measures %>% 
+  left_join(pws_list_cl, by = "pwsid") 
+
+table(five_year_measures_w_all_covariates$pws_type_code)
+
+# select relevant covariates
+df_w_all_covariates <- five_year_measures_w_all_covariates %>% 
+  dplyr::select(pwsid:mon_only_5yr_binary, 
+                pws_name, 
+                
+                # system type
+                pws_type_code, # binary (cws or ntnc)
+                
+                # source water
+                gw_sw_code, # binary (gw or sw)
+                primary_source_code, # categorical, 5 categories
+                
+                # 2 options for system size
+                population_served_count, 
+                service_connections_count
+                )
+  
+table(df_w_all_covariates$gw_sw_code) 
+
+
+
+
+################################################################################
+################################################################################
+### save
+
+saveRDS(health_data, "processed_data/health_data.rds")
+saveRDS(mr_data, "processed_data/mr_data.rds")
+
+saveRDS(all_pwsids_viols_per_year, "processed_data/all_pwsids_viols_per_year.rds")
+write_csv(all_pwsids_viols_per_year, "processed_data/all_pwsids_viols_per_year.csv")
+
+saveRDS(five_year_measures, "processed_data/five_year_measures.rds")
+write_csv(five_year_measures, "processed_data/five_year_measures.csv")
+
+saveRDS(df_w_all_covariates, "processed_data/df_w_all_covariates.rds")
+write_csv(df_w_all_covariates, "processed_data/df_w_all_covariates.csv")
+
+```
+
+
+# 3c. join outcome data to typology data
+```{r}
+################################################################################
+################################################################################
+### load
+typology <- readRDS("processed_data/typology.rds")
+dim(typology) # 4301   55
+
+df_w_all_covariates <- readRDS("processed_data/df_w_all_covariates.rds")
+dim(df_w_all_covariates) # 4301   11
+
+typology_simple <- typology %>% 
+  dplyr::select(pwsid_echo, carceral_sys)
+
+
+################################################################################
+### join
+
+acr_df_for_analysis <- df_w_all_covariates %>% 
+  left_join(typology_simple, by = c("pwsid" = "pwsid_echo"))
+
+saveRDS(acr_df_for_analysis, "processed_data/acr_df_for_analysis.rds")
+write.csv(acr_df_for_analysis, "outputs/acr_df_for_analysis.csv")
+
+```
+
+
+

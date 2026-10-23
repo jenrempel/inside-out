@@ -1,0 +1,108 @@
+---
+title: "06_population_analysis"
+author: Jenny Rempel
+output: html_document
+---
+
+# Script overview: 
+This script responds to a reviewer request for additional population analysis.
+
+# Inputs:
+- "outputs/fullpaperdata.csv" (created in script 04)
+- "outputs/tbl_s2.rds" (created in script 01)
+- "processed_data/prisons_ca_flat.rds" (created in script 01)
+
+# Key Outputs:
+- "outputs/si_table_s3.csv" (Table S3)
+
+```{r}
+# Install pacman if not present
+if (!requireNamespace("pacman", quietly = TRUE)) install.packages("pacman")
+
+# Check, install missing, and load all packages in one call
+pacman::p_load(tidyverse)
+
+```
+
+
+```{r}
+# load main paper data
+df1 <- read_csv("outputs/fullpaperdata.csv")
+table(df1$carceral_sys)
+
+# load df matching facilities to PWSIDs
+tbl_s2 <- readRDS("outputs/tbl_s2.rds")
+nrow(tbl_s2) # 345 (some have closed)
+
+# load hifld data with population and facilities
+prisons_ca_flat <- readRDS("processed_data/prisons_ca_flat.rds")
+nrow(prisons_ca_flat) # 357
+
+# make NAs explicit & simplify
+prisons_ca_flat_pop <- prisons_ca_flat %>% 
+  mutate(population = ifelse(population == -999, NA, population)) %>% 
+  dplyr::select(facilityid, population)
+
+# simplify
+facility_pws <- tbl_s1 %>% 
+  dplyr::select(facility_name, facilityid, pwsid, pws_name)
+
+# join popn data to facility-pws data
+facilities_w_pws <- facility_pws %>% 
+  left_join(prisons_ca_flat_pop, by = "facilityid")
+  
+# sum popn by pwsid
+facility_popn <- facilities_w_pws %>% 
+  group_by(pwsid) %>% 
+  summarize(sum_pop = sum(population))
+  # note - if we want to remove NAs we can add na.rm=TRUE
+  # but then PWSs that serve multiple facilities could look like they have a low
+  # % of the PWS popn that is incarcerated, when that's really probably driven
+  # by missing data for a key facility (eg. CDCR CALIFORNIA HEALTH CARE FACILITY
+  # is missing data so it looks like it's only 3% carceral-serving, but that's likely
+  # due to the fact that the main facility (i.e. CA health care facility) is 
+  # missing data, while a smaller facility we identified as also served by the 
+  # PWS has some data)
+  #summarize(sum_pop = sum(population, na.rm=TRUE))
+  
+# join to main df
+df <- df1 %>% 
+  left_join(facility_popn, by = "pwsid")
+
+# calculate percentage of the PWS popn that is incarcerated
+df <- df %>% 
+  mutate(pop_less_prison = population_served_count - sum_pop,
+         pct_pws_pop_incarcerated = sum_pop / population_served_count * 100) %>% 
+  mutate(pct_pws_pop_incarcerated = round(pct_pws_pop_incarcerated, 
+                                          digits = 2)) %>% 
+  relocate(sum_pop, pop_less_prison, pct_pws_pop_incarcerated, 
+           .after = population_served_count) 
+
+# categorize pws's based on % of PWS popn that is incarcerated
+si_table <- df %>% 
+  filter(carceral_sys != "other_water_systems") %>% 
+  group_by(carceral_sys) %>% 
+  summarize(n_pws_missing = sum(is.na(sum_pop)),
+            n_pws_greater_half_carceral_pop = 
+              sum(pct_pws_pop_incarcerated >= 50, na.rm=TRUE),
+            n_pws_less_half_carceral_pop = 
+              sum(pct_pws_pop_incarcerated < 50, na.rm=TRUE))
+
+# create simpler version for manual review
+pop_data <- df %>% 
+  filter(!is.na(pct_pws_pop_incarcerated)) %>% 
+  dplyr::select(pwsid, pws_name, pws_type_code, 
+                population_served_count:pct_pws_pop_incarcerated,
+                carceral_sys) %>% 
+  arrange(pct_pws_pop_incarcerated)
+
+# create Table S3 (focused only on partially carceral serving systems)
+si_table_s3 <- pop_data %>% 
+  filter(carceral_sys == "carceral_serving_water_system") %>% 
+  dplyr::select(pwsid, pws_name, pct_pws_pop_incarcerated)
+
+# save files
+write_csv(si_table_s3, "outputs/si_table_s3.csv")
+
+```
+

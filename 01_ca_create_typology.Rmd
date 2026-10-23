@@ -1,0 +1,1181 @@
+---
+title: "01_ca_create_typology"
+author: Jenny Rempel
+output: html_document
+---
+
+# Script overview: 
+This script creates the typology of water systems described in the manuscript. It also creates Tables S1 and S2.
+
+# Inputs:
+- "raw_data/ca_boundaries_072325/California_Drinking_Water_System_Area_Boundaries.geojson" (CA SWRCB system boundary data downloaded July 23, 2025 from the CA State Geoportal; https://gis.data.ca.gov/datasets/waterboards::california-drinking-water-system-area-boundaries/about)
+
+- "raw_data/Prison_Boundaries.geojson" (HIFLD prison boundaries dataset downloaded April 30, 2025, from https://hifld-geoplatform.hub.arcgis.com/datasets/geoplatform::prison-boundaries-1/explore?location=0.000000%2C-10.417157%2C0.00&showTable=true)
+
+- "raw_data/SDWA_latest_downloads/SDWA_PUB_WATER_SYSTEMS.csv" (Safe Drinking Water Act (SDWA) public water system file downloaded 1/17/25 from USEPA SDWIS/ECHO: https://echo.epa.gov/files/echodownloads/SDWA_latest_downloads.zip downloaded from https://echo.epa.gov/tools/data-downloads; data download summary: https://echo.epa.gov/tools/data-downloads/sdwa-download-summary; date data extracted: 1/11/2025 noted on https://echo.epa.gov/resources/echo-data/about-the-data)
+
+- "intermediate_data/updated_HIFLD_list_with_closures.xlsx" (created by research team)
+
+- "intermediate_data/closest_pws_w_name_assigned_final.xlsx" (created by research team)
+
+- "intermediate_data/multimatch_manual_check_assigned_final.xlsx" (created by research team)
+
+# Key outputs:
+- "processed_data/universe_pwsids.rds" (used in script 02)
+
+- "processed_data/typology.rds" (used in script 02)
+
+- "outputs/tbl_s1.rds" (used in script 06)
+
+- "processed_data/prisons_ca_flat.rds" (used in script 06)
+
+# Requires:
+- pacman, tidyverse, janitor, sf, lubridate, mapview, readxl
+
+
+# step 0. Setup (always run these)
+```{r}
+# Install pacman if not present
+if (!requireNamespace("pacman", quietly = TRUE)) install.packages("pacman")
+
+# Check, install missing, and load all packages in one call
+pacman::p_load(tidyverse, # general purpose
+               janitor,#  tidying dataframes
+               sf, # spatial work
+               lubridate, # dates
+               mapview,# mapping
+               readxl) # read excel files
+
+options(tigris_use_cache = TRUE)
+```
+
+```{r useful functions}
+
+# %notin%: operator that returns the negation of %in%
+`%notin%` <- Negate(`%in%`)
+
+# count_df_na: takes a dataframe and returns counts of NA values in each column
+count_df_na <- function(df) {
+  sapply(df, function(x) sum(is.na(x)))
+}
+
+# view_flat: quick look at sf objects w/o geometry
+view_flat <- function(df) {
+  st_drop_geometry(df) %>% 
+    View()
+}
+
+```
+
+
+
+# step 1. spatial intersection
+## 1a. prep datasets
+```{r}
+###
+# load
+### 
+
+# ca pws service area boundaries - downloaded 7/23/25
+ca_sabl <- read_sf("raw_data/ca_boundaries_072325/California_Drinking_Water_System_Area_Boundaries.geojson")
+dim(ca_sabl) # 4804   35
+
+# hifld carceral facility boundaries - downloaded January 17, 2025 from
+# https://hifld-geoplatform.hub.arcgis.com/datasets/geoplatform::prison-boundaries-1/explore?location=0.000000%2C-10.417157%2C0.00&showTable=true 
+prisons_all_raw <- sf::read_sf("raw_data/Prison_Boundaries.geojson") 
+dim(prisons_all_raw) # 6468. 27
+
+
+###
+# clean and filter PWSs
+### 
+
+# clean
+ca_sabl_c <- ca_sabl %>% 
+  janitor::clean_names()
+
+# are they all active?
+table(ca_sabl_c$activity_status_cd) # all active
+
+# what classifications?
+table(ca_sabl_c$federal_classification, ca_sabl_c$state_classification) 
+  # one looks odd; others make sense 
+
+# look at that system
+ca_sabl_c %>% filter(federal_classification == "NON-PUBLIC" & 
+                       state_classification == "COMMUNITY") 
+  # we'll keep it as a CWS
+
+# quick look on map
+#ca_sabl_c_s <- ca_sabl_c %>% 
+#  dplyr::select(water_system_name, county, population, 
+#                federal_classification,state_classification)
+#mapview(ca_sabl_c_s)
+
+# quick look on map at non-cws
+#ca_sabl_c_non_cws <- ca_sabl_c %>% 
+#  dplyr::select(water_system_name, county, population, 
+#                federal_classification,state_classification) %>% 
+#  dplyr::filter(federal_classification != "COMMUNITY")
+#mapview(ca_sabl_c_non_cws)
+
+# filter to possible system types
+ca_sabl_public <- ca_sabl_c %>% 
+  filter(state_classification %in% c("COMMUNITY", "NON-TRANSIENT NON-COMMUNITY",
+                                     # here we include TNC just in case; 
+                                     # ultimately no carceral facilities join to TNC systems
+                                     "TRANSIENT NON-COMMUNITY"))
+  # alternatively, can exclude: 
+  # c("NON-PUBLIC", "Recycled Water", "LOCAL STATE SMALL SYSTEM", "STATE SMALL WATER SYSTEM")
+  
+nrow(ca_sabl_public) # 4725
+
+# how many have been verified by the CA SWRCB?
+table(ca_sabl_public$verified_status)
+  # 2605 not verified; 2062 verified; 58 pending
+  # note: there are some duplicates (e.g. jurisdictional, boundary)
+
+# make sure that looks good
+#table(ca_sabl_public$state_classification) # good: CWS, NTNC, TNC
+#table(ca_sabl_public$federal_classification) # hm, what are the non-publics?
+# check that
+#chk <- ca_sabl_public %>% filter(federal_classification == "NON-PUBLIC") 
+#view_flat(chk) # 3 TNC; 1 CWS; none of these ultimately join to carceral facilities
+
+
+### 
+# clean & filter to appropriate carceral facilities
+###
+
+# clean
+prisons_all <- prisons_all_raw %>% 
+  janitor::clean_names()
+  
+# select open facilities in CA
+prisons_ca <- prisons_all %>%
+  filter(status == "OPEN", state == "CA") 
+nrow(prisons_ca) # 357
+
+# make flat version for any manual analyses
+prisons_ca_flat <- prisons_ca %>% 
+  st_drop_geometry()
+write_csv(prisons_ca_flat, "processed_data/prisons_ca_flat.csv")
+saveRDS(prisons_ca_flat, "processed_data/prisons_ca_flat.rds")
+
+
+###
+# save
+###
+
+saveRDS(ca_sabl_public, "processed_data/ca_sabl_public.rds")
+saveRDS(prisons_ca, "processed_data/prisons_ca.rds")
+
+# for double checking analysis in ArcGIS, save copy w/ updated column names
+ca_sabl_arc <- ca_sabl
+ca_sabl_arc <- ca_sabl_arc %>% 
+  rename(pwsid_numb = WATER_SYSTEM_NUMBER,
+         wat_sys_name = WATER_SYSTEM_NAME,
+         address1 = ADDR_LINE_ONE_TXT,
+         address2 = ADDR_LINE_TWO_TXT) %>% 
+  dplyr::select(-c("LAST_EDITED_USER","LAST_EDITED_DATE"))
+names(ca_sabl_arc) <- substr(names(ca_sabl_arc), 1, 10) # keep first 10 characters
+
+st_write(ca_sabl_arc, "processed_data/ca_sabl_arc.shp", delete_layer = TRUE)
+  # some shape_area warnings but not using that field
+
+```
+At this point, the team manually identified 9 facilities listed as open that had in fact closed.
+
+## 1b. filter prisons and perform spatial intersection
+```{r}
+
+###
+# load
+###
+
+ca_sabl_public <- readRDS("processed_data/ca_sabl_public.rds")
+prisons_ca <- readRDS("processed_data/prisons_ca.rds")
+
+# closed facilities - created by team
+closed_facilities <- read_xlsx("intermediate_data/updated_HIFLD_list_with_closures.xlsx")
+
+# remove 9 closed systems (identified manually by team)
+prisons_ca_open <- prisons_ca %>% 
+  filter(facilityid %notin% closed_facilities$FACILITYID)
+
+nrow(prisons_ca) # 357
+nrow(prisons_ca_open) # 348
+nrow(prisons_ca) - nrow(prisons_ca_open) # 9, good
+
+
+###
+# prep for, perform, and assess spatial intersection
+###
+
+# check CRSs
+st_crs(prisons_ca_open) # epsg 4326, WGS84  
+st_crs(prisons_ca_open)$IsGeographic # true (i.e., in degrees, needs to be transformed)
+st_crs(ca_sabl_public) == st_crs(prisons_ca_open) 
+  # both need to be transformed to a projected crs
+
+# transform
+prisons_t <- st_transform(prisons_ca_open, crs = "EPSG:3310")
+ca_sabl_t <- st_transform(ca_sabl_public, crs = "EPSG:3310")
+
+# 
+nrow(prisons_t) # 348
+nrow(ca_sabl_t) # 4725; includes some duplicates
+
+# simple intersection
+prisons_pws_intersection <- st_intersection(x = prisons_t,
+                                            y = ca_sabl_t)
+glimpse(prisons_pws_intersection)
+
+# how many facilities match to 1 (or 0), 2, or 3 PWSs?
+# count # matched
+count_ca <- prisons_pws_intersection %>% 
+  st_drop_geometry() %>% 
+  group_by(facilityid) %>% 
+  count()
+table(count_ca$n)
+
+# save single intersections (i.e. exactly one carceral facility & 1 PWS)
+prisons_pws_intersection_single <- prisons_pws_intersection %>% 
+  st_drop_geometry() %>% 
+  group_by(facilityid) %>% 
+  mutate(n = n()) %>% 
+  filter(n == 1)
+nrow(prisons_pws_intersection_single) # 265 facilities match to exactly 1 PWS
+
+# save list of facilities that did not intersect with any PWS
+no_match_ca <- prisons_t %>% 
+  filter(facilityid %notin% count_ca$facilityid)
+nrow(no_match_ca) # 46
+
+# so: 
+# 46 facilities intersect with 0 PWSs
+# 265 facilities intersect with exactly 1 PWS
+# 36 facilities intersect with 2 PWSs
+# 1 facility intersects with 3 PWSs
+46+265+36+1 # 348, good
+46+265+36+1  == nrow(prisons_t) # true
+
+# save list of facilities that intersect 2-3 PWSs
+multimatch_ids <- count_ca %>% 
+  filter(n>1)
+nrow(multimatch_ids) # 37, good
+multimatch_ca <- prisons_t %>% 
+  filter(facilityid %in% multimatch_ids$facilityid)
+nrow(multimatch_ca) # 37
+
+# save list of facilities that intersect exactly 1 PWS
+singlematch_ids <- count_ca %>% 
+  filter(n == 1) 
+singlematch_ca <- prisons_t %>% 
+  filter(facilityid %in% singlematch_ids$facilityid)
+nrow(singlematch_ca) # 265
+
+## map
+
+# simplify for mapping (can skip)
+#pws_simple <- ca_sabl_t %>% 
+#  dplyr::select(water_system_name, sabl_pwsid,
+#                county, population, 
+#                federal_classification, state_classification) 
+#dim(pws_simple) # 4725    7
+
+# simplify for mapping and analysis
+multimatch_ca_simple <- multimatch_ca %>% 
+  dplyr::select(name, address, city, type, population, county)
+
+# simplify for mapping (can skip)
+#no_match_ca_simple <- no_match_ca %>% 
+#  dplyr::select(name, address, city, type, population, county)
+
+# simplify for mapping (can skip)
+#single_match_ca_simple <- singlematch_ca %>% 
+#  dplyr::select(name, address, city, type, population, county)
+
+# multimatch
+#mapview(multimatch_ca_simple, 
+#        zcol = "name",
+#        col.regions = "red", col = "red") +
+#  mapview(pws_simple, 
+#          zcol= "water_system_name",
+#          col.regions = "lightblue", col = "black", legend = FALSE)
+
+# no match
+#mapview(no_match_ca_simple, 
+#        zcol = "name",
+#        col.regions = "red", col = "red") +
+#  mapview(pws_simple, 
+#          zcol= "water_system_name",
+#          col.regions = "lightblue", col = "black", legend = FALSE)
+
+
+## write a for loop for "no match" facilities
+# for each of the carceral facilities w/o a spatial intersection to a PWS,
+# the for loop will identify the nearest pws & note its distance 
+#facilities <- no_match_ca_simple$name
+#n <- length(facilities)
+#pws <- rep("NA", n)
+#distance <- rep("NA", n)
+#closest_pws <- data.frame(facility = facilities, pwsid = pws, distance = distance)
+#for(i in seq_len(nrow(closest_pws))){
+  # identify the pws
+#  pws_identified <- pws_simple[which.min(
+#    st_distance(pws_simple, no_match_ca_simple[i,])),"sabl_pwsid"]
+  # assign the pwsid to the right row/facility in the dataframe
+#  closest_pws[i,"pwsid"] <- pws_identified %>% st_drop_geometry()
+  # calculate the distance
+#  pws_distance <- st_distance(pws_identified, no_match_ca_simple[i,])
+  # assign that distance to the right row/facility in the dataframe
+#  closest_pws[i,"distance"] <- pws_distance %>% st_drop_geometry()
+#}
+
+#closest_pws_assigned <- closest_pws
+# add water system names
+#closest_pws_w_name <- closest_pws_assigned %>% 
+#  left_join(pws_simple, by = c("pwsid" = "sabl_pwsid")) %>% 
+#  dplyr::select(facility, pwsid, water_system_name, distance)
+# add to facility geometry
+#closest_pws_w_name_sf <- no_match_ca_simple %>% 
+#  left_join(closest_pws_w_name, by = c("name" = "facility"))
+
+  #filter(facility_id %in% closest_pws_w_name$facility)
+
+#write_csv(closest_pws_w_name, "processed_data/closest_pws_w_name_081125.csv")
+
+
+# map
+#mapview(closest_pws_w_name_sf, 
+#        zcol = "name",
+#        col.regions = "red", col = "red") +
+#  mapview(pws_simple, 
+#          zcol= "water_system_name",
+#          col.regions = "lightblue", col = "black", legend = FALSE)
+
+
+## now deal with multi-match facilities
+# spatial intersection of multimatch_ca_simple (37 carceral facilities)
+nrow(multimatch_ca_simple)
+prisons_pws_intersection_multi <- st_intersection(x = multimatch_ca_simple,
+                                            y = ca_sabl_t)
+
+nrow(prisons_pws_intersection_multi) # 75 
+nrow(prisons_pws_intersection_multi) == 36*2 + 1*3 # true, good
+
+# simplify
+multimatch_manual_check <- prisons_pws_intersection_multi %>% 
+  dplyr::select(name, address, city, type, population, county,
+                sabl_pwsid, boundary_type, water_system_name) %>% 
+  st_drop_geometry() %>% 
+  arrange(desc(name))
+
+dim(multimatch_manual_check) # 75  9
+
+## at this point, I wrote this file to a csv for analysis
+#write_csv(multimatch_manual_check, "processed_data/multimatch_manual_check_081125.csv")
+
+saveRDS(prisons_pws_intersection_single, "processed_data/prisons_pws_intersection_single.rds")
+saveRDS(ca_sabl_t, "processed_data/ca_sabl_t.rds")
+saveRDS(prisons_t, "processed_data/prisons_t.rds")
+saveRDS(prisons_ca_open, "processed_data/prisons_ca_open.rds")
+```
+
+Note: At this point, multimatch and non-match facilities were manually examined to identify the PWS. 
+
+# step 2. finalize prison status dataset
+
+## 2a. finalize list of water systems serving carceral facilities
+```{r}
+# load lists
+nomatch <- read_xlsx("intermediate_data/closest_pws_w_name_assigned_final.xlsx")
+multimatch <- read_xlsx("intermediate_data/multimatch_manual_check_assigned_final.xlsx")
+prisons_pws_intersection <- readRDS("processed_data/prisons_pws_intersection_single.rds")
+prisons_ca_open <- readRDS("processed_data/prisons_ca_open.rds")
+
+# load list of cws's from institutional analysis (for exclusive carceral list)
+cws_list <- read_csv("raw_data/ca_institutional_type/FINAL 2023 Inst. type update.csv")
+nrow(cws_list) # 2967
+
+# load ca-sabl boundaries and prison locations (for diagnosing one system)
+ca_sabl_t <- readRDS("processed_data/ca_sabl_t.rds")
+prisons_t <- readRDS("processed_data/prisons_t.rds")
+
+###
+# make list of carceral facilities and associated cws
+###
+
+# simplify each list to select pwsid & carceral facility name or ID
+nomatch_joined <- nomatch %>% 
+  dplyr::select(PWSID, facility_name)
+
+multimatch_joined <- multimatch %>% 
+  dplyr::select(PWSID, facility_name)
+
+prisons_pws_intersection_joined <- prisons_pws_intersection %>% 
+  dplyr::select(facilityid, sabl_pwsid)
+
+## join those matched list to the full prison data (to add back details)
+# simplify
+prisons_simple <- prisons_ca_open %>% 
+  dplyr::select(facilityid, name)
+
+# join
+nomatch_joined2 <- nomatch_joined %>% 
+  left_join(prisons_simple, by = c("facility_name" = "name")) %>% 
+  mutate(match_method = "nomatch_manual_assign")
+nrow(nomatch_joined2) == nrow(nomatch) # true
+nrow(nomatch_joined2) # 27, good
+#glimpse(nomatch_joined2)
+
+multimatch_joined2 <- multimatch_joined %>% 
+  left_join(prisons_simple, by = c("facility_name" = "name")) %>% 
+  mutate(match_method = "multimatch_manual_assign")
+nrow(multimatch_joined2) == nrow(multimatch) # true
+nrow(multimatch_joined2) # 35, good
+#glimpse(multimatch_joined2)
+
+prisons_pws_intersection_joined2 <- prisons_pws_intersection_joined %>% 
+  left_join(prisons_simple, by = "facilityid") %>% 
+  rename(PWSID = sabl_pwsid,
+         facility_name = name) %>% 
+  relocate(PWSID, facility_name, facilityid) %>% 
+  mutate(match_method = "spatial_intersection")
+nrow(prisons_pws_intersection_joined2) # 265
+#glimpse(prisons_pws_intersection_joined2)
+
+names(nomatch_joined2) == names(multimatch_joined2)  # true
+names(multimatch_joined2)  == names(prisons_pws_intersection_joined2) # true
+
+all_prisons_w_pwsid_info_from_spatial <- prisons_pws_intersection_joined2 %>% 
+  bind_rows(nomatch_joined2) %>% 
+  bind_rows(multimatch_joined2) %>% 
+  ungroup() %>% 
+  st_drop_geometry()
+
+nrow(multimatch_joined2) + nrow(nomatch_joined2) + nrow(prisons_pws_intersection_joined2) == nrow(all_prisons_w_pwsid_info_from_spatial) # true
+table(all_prisons_w_pwsid_info_from_spatial$match_method)
+
+# find the unmatched ones
+prisons_missing_pwsid <- prisons_ca_open %>% 
+  filter(facilityid %notin% all_prisons_w_pwsid_info_from_spatial$facilityid) %>% 
+  mutate(PWSID = "not_matched",
+         match_method = "not_matched") %>% 
+  rename(facility_name = name) %>% 
+  dplyr::select(PWSID, facility_name, facilityid, match_method) %>% 
+  # leave here for ordering
+  st_drop_geometry()
+nrow(prisons_missing_pwsid) # 21
+
+# manually remove the one we identified has closed
+prisons_missing_pwsid2 <- prisons_missing_pwsid %>% 
+  filter(facilityid != "10006705")
+nrow(prisons_missing_pwsid2) # 20, as expected
+
+# check
+nrow(prisons_ca_open) == nrow(all_prisons_w_pwsid_info_from_spatial) + nrow(prisons_missing_pwsid2) + 1 # true (+1 is for the facility we identified has closed)
+
+# join
+all_prisons_w_pwsid_status <- prisons_missing_pwsid2 %>% 
+  bind_rows(all_prisons_w_pwsid_info_from_spatial)
+nrow(all_prisons_w_pwsid_status) + 1 == nrow(prisons_ca_open) # true
+  # (+1 is for the facility we identified has closed)
+table(all_prisons_w_pwsid_status$match_method) # 20 not matched
+
+# save
+write_csv(all_prisons_w_pwsid_status, "outputs/all_prisons_w_pwsid_status.csv")
+saveRDS(all_prisons_w_pwsid_status, "processed_data/all_prisons_w_pwsid_status.rds")
+write_csv(prisons_missing_pwsid2, "outputs/unmatched_facilities.csv")
+
+
+###
+# identify CWS by carceral facility status
+###
+
+# clean the list of exclusive carceral systems
+cws_list_c <- cws_list %>% 
+  janitor::clean_names()
+
+# filter the dryad list for appropriate systems
+cws_list_carceral <- cws_list_c %>% 
+  filter(inst_subtype == "Carceral")
+nrow(cws_list_carceral) # 45
+
+## first, check that the same system was assigned via dryad and spatial analysis
+#view(cws_list_carceral)
+
+
+## now, remove exclusive carceral systems from the non-exclusive (i.e. spatial-join) list
+pws_carceral_nonexclusive <- all_prisons_w_pwsid_info_from_spatial %>% 
+  rename(pwsid = PWSID) %>% 
+  filter(pwsid %notin% cws_list_carceral$pwsid)
+
+## checks
+length(cws_list_carceral$pwsid) # 45 PWSs on dryad list
+length(unique(all_prisons_w_pwsid_info_from_spatial$PWSID)) 
+  # 208 PWSs on initial list (incl both exclusive & non-exclusive carceral facilities)
+length(unique(all_prisons_w_pwsid_info_from_spatial$facilityid)) 
+  # 327 facilities on initial list
+
+length(unique(pws_carceral_nonexclusive$pwsid)) 
+  # 165 PWSs on subsequent list (i.e. non-exclusive carceral PWSs)
+length(unique(pws_carceral_nonexclusive$facilityid)) 
+  # 268 facilities on subsequent list (i.e. served by non-exclusive carceral PWSs)
+
+208-165 # 43 PWSs matched to carceral facilities via both Dryad list and spatial analysis
+327-268 # 59 facilities matched to PWSs via both Dryad list and spatial analysis
+
+# table of match method for initial list (incl both exclusive & non-exclusive carceral facilities)
+table(all_prisons_w_pwsid_info_from_spatial$match_method)
+
+# table of match method for filtered nonexclusive list
+table(pws_carceral_nonexclusive$match_method)
+
+# which 2 PWSs were on Dryad list but not identified via spatial analysis?
+cws_list_carceral_chk <- cws_list_carceral %>% 
+  filter(pwsid %notin% all_prisons_w_pwsid_info_from_spatial$PWSID)
+
+print(cws_list_carceral_chk)
+  # 1 facility (pilot rock) has since closed
+  # gilbert street complex - need to check
+
+# look at gilbert on map
+gilbert <- ca_sabl_t %>% 
+  filter(sabl_pwsid == "CA3600215")
+
+# map
+#mapview(gilbert) + 
+#  mapview(prisons_t)
+
+# it looks like the CWS service area boundary is inaccurately drawn
+# reassign to this CWS:
+  # facilityid 10005329, CENTRAL VALLEY JUVENILE DETENTION AND ASSESSMENT CENTER
+  # facilityid 10005330, REGIONAL YOUTH EDUCATIONAL FACILITY (previously assigned CA3610039)
+  # the address listed indicates gilbert street, not the address where the PWS
+  # service area boundary is drawn, and it is unconfirmed.
+  # Therefore, we will manually reassign these 2 facilities
+
+#view_flat(all_prisons_w_pwsid_info_from_spatial)
+  # both were previously assigned CA3610039 (city of san bernardino) via spatial analysis
+
+
+# next, look at pilot rock on map
+pilot_rock <- ca_sabl_t %>% 
+  filter(sabl_pwsid == "CA3610801")
+
+# map
+#mapview(pilot_rock) + 
+#  mapview(prisons_t)
+  # from google maps, perhaps it is serving the fire center that's still there
+
+# is there another pws nearby that would be serving the remaining facilities?
+sb <- ca_sabl_t %>% 
+  filter(county == "SAN BERNARDINO")
+
+# map
+#mapview(pilot_rock) + 
+#  mapview(sb)
+  # Clawa CWS (CA3610114) overlaps and its service area is listed as verified by CA SWRCB DDW
+  # Clawa is a residential + wholesale CWS.
+  # It's possible that Clawa provides water to the now non-carceral fire facilities at 
+  # the Pilot Rock Fire Center.
+  # Either way, because the Conservation Camp has closed, we list the Pilot Rock
+  # CWS (CA3610801) as non-carceral now.
+
+
+# manually reassign exclusive carceral systems
+cws_list_exclusive_carceral_near_final <- cws_list_carceral %>% 
+  # remove pilot rock from this list
+  filter(pwsid != "CA3600215") %>% 
+  # remove gilbert street complex from this list
+  filter(pwsid != "CA3610801")
+nrow(cws_list_exclusive_carceral_near_final) # 43, good 
+
+# manually reassign 2 facilities matched via spatial analysis to gilbert street
+pws_carceral_nonexclusive_near_final <- pws_carceral_nonexclusive %>% 
+  mutate(pwsid = ifelse(facilityid %in% c("10005329", "10005330"),
+                        "CA3600215", pwsid))
+length(unique(pws_carceral_nonexclusive$pwsid)) # 165
+length(unique(pws_carceral_nonexclusive_near_final$pwsid)) #166 
+  # number of PWSs goes up by one bc City of San Bernardino is still identified
+  # as serving one other carceral facility, and CA3600215 (Gilbert St) is now added
+  # to this list.
+
+### 
+# last step: manually reassign some PWSs as exclusively carceral PWSs
+###
+
+# at this point, we manually reviewed the list of non-exclusive carceral PWSs 
+# to see if any of them were in fact better characterized as exclusively carceral.
+# I manually reassign these here.
+
+## adjust the nonexclusive list
+pws_carceral_nonexclusive_final <- pws_carceral_nonexclusive_near_final %>% 
+  # remove the PWS serving LOS PRIETOS BOYS CAMP (facility id: 10006710), which
+  # we previously identified had closed,
+  # and is thus placed on the 'other water systems' (non-carceral) list
+  filter(pwsid != "CA4200918") %>%
+   # remove the PWS serving Valley View (facility id: 10005275), which seems to have closed
+  # and is thus placed on the 'other water systems' (non-carceral) list
+  filter(pwsid != "CA1110800") %>%
+  # remove 15 systems reassigned as exclusively carceral
+  filter (pwsid %notin% c("CA0810800",
+                          "CA1810801",
+                          "CA1900007",
+                          "CA1900089",
+                          "CA1900901",
+                          "CA1900904",
+                          "CA2310800",
+                          "CA4410800",
+                          "CA4510800",
+                          "CA5210800",
+                          "CA5210801",
+                          "CA4710800",
+                          "CA5310800",
+                          "CA5400797",
+                          "CA5401074")) 
+
+## adjust the exclusive list
+cws_list_exclusive_carceral_near_final2 <- cws_list_exclusive_carceral_near_final %>% 
+  dplyr::select(pwsid)
+
+# make list - 15
+add_to_excl_carceral <- c("CA0810800",
+                          "CA1810801",
+                          "CA1900007",
+                          "CA1900089",
+                          "CA1900901",
+                          "CA1900904",
+                          "CA2310800",
+                          "CA4410800",
+                          "CA4510800",
+                          "CA4710800",
+                          "CA5210800",
+                          "CA5210801",
+                          "CA5310800",
+                          "CA5400797",
+                          "CA5401074")
+
+# make df
+add_to_excl_carceral2 <- as.data.frame(add_to_excl_carceral) %>% 
+  rename(pwsid = add_to_excl_carceral)
+
+cws_list_exclusive_carceral_near_final3 <- cws_list_exclusive_carceral_near_final2 %>% 
+  bind_rows(add_to_excl_carceral2)
+
+nrow(cws_list_exclusive_carceral_near_final2) # 43
+nrow(cws_list_exclusive_carceral_near_final3) # 58; 15 added, good
+
+cws_list_exclusive_carceral_final <- cws_list_exclusive_carceral_near_final3 %>% 
+  mutate(match_method = "exclusively_carceral_per_dryad_and_manual_chk")
+  
+# save IDs
+pws_carceral_nonexclusive_final_ids <- pws_carceral_nonexclusive_final %>% 
+  st_drop_geometry() %>% 
+  dplyr::select(pwsid, match_method)
+
+# how many systems?
+length(unique(pws_carceral_nonexclusive_final_ids$pwsid)) # 149
+length(unique(cws_list_exclusive_carceral_final$pwsid)) # 58
+
+
+### 
+# for universe selection purposes, double check that there are no TNC systems
+### 
+
+# create a list of the pwsids
+ids1 <- pws_carceral_nonexclusive_final_ids$pwsid
+ids2 <- cws_list_exclusive_carceral_final$pwsid
+carceral_sys_ids <- c(ids1, ids2)
+carceral_sys_ids <- unique(carceral_sys_ids)
+length(carceral_sys_ids)
+149+58 # 207, good 
+
+# dbl chk no ids from exclusive on nonexclusive list
+chk <- pws_carceral_nonexclusive_final_ids %>% 
+  filter(pwsid %in% cws_list_exclusive_carceral_final$pwsid)
+nrow(chk) # 0, good
+
+# and vice versa
+chk <- cws_list_exclusive_carceral_final %>% 
+  filter(pwsid %in% pws_carceral_nonexclusive_final_ids$pwsid)
+nrow(chk) # 0, good
+
+# pull associated data from CA SABL
+chk_if_tnc <- ca_sabl_t %>% 
+  filter(sabl_pwsid %in% carceral_sys_ids)
+
+# are there any tnc systems associated?
+table(chk_if_tnc$federal_classification) # all CWS or NTNC
+table(chk_if_tnc$state_classification) # all CWS or NTNC
+  # since there are no tnc systems, we will focus on CWS and NTNC systems in the next step
+
+
+###
+# save
+###
+
+saveRDS(pws_carceral_nonexclusive_final, "processed_data/pws_carceral_nonexclusive_final.rds")
+dim(pws_carceral_nonexclusive_final) # 247   5
+
+saveRDS(pws_carceral_nonexclusive_final_ids, "processed_data/pws_carceral_nonexclusive_final_ids.rds")
+dim(pws_carceral_nonexclusive_final_ids) # 247 x 2
+
+saveRDS(cws_list_exclusive_carceral_final, "processed_data/cws_list_exclusive_carceral_final.rds")
+dim(cws_list_exclusive_carceral_final) # 58 x 2
+
+saveRDS(carceral_sys_ids, "processed_data/carceral_sys_ids.rds")
+length(carceral_sys_ids) # 207
+```
+
+## 2b.i. add universe of all systems
+```{r}
+
+###
+# load
+###
+
+# lists
+pws_carceral_nonexclusive_final_ids <- readRDS("processed_data/pws_carceral_nonexclusive_final_ids.rds")
+
+cws_list_exclusive_carceral_final <- readRDS("processed_data/cws_list_exclusive_carceral_final.rds")
+
+carceral_sys_ids <- readRDS("processed_data/carceral_sys_ids.rds")
+
+# usepa sdwis (echo data)
+pws_list <- read_csv("raw_data/SDWA_latest_downloads/SDWA_PUB_WATER_SYSTEMS.csv")
+nrow(pws_list) # 431754
+
+
+###
+# clean ECHO for relevant systems (CWS and NTNC)
+###
+
+# clean echo data
+pws_list_cl <- pws_list %>%
+  janitor::clean_names() %>%
+  mutate(pws_deactivation_date_2 =
+           lubridate::mdy(pws_deactivation_date),
+         first_reported_date_2 =
+           lubridate::mdy(first_reported_date)) %>% 
+  relocate(pwsid, pws_deactivation_date, pws_deactivation_date_2,
+           first_reported_date, first_reported_date_2)
+nrow(pws_list_cl) # 431754
+
+## inspect data
+# confirm pwsid is unique
+length(unique(pws_list_cl$pwsid)) == nrow(pws_list_cl) # true, good
+table(pws_list_cl$submissionyearquarter) # all Q4 2024, good
+
+## filtering by pws type
+# look at pws type
+table(pws_list_cl$pws_type_code) 
+
+# filter for CWSs and NTNCs
+cws_and_ntnc <- pws_list_cl %>% 
+  filter(pws_type_code %in% c("CWS", "NTNCWS"))
+nrow(cws_and_ntnc) # 145752
+
+# filter for CA systems
+cws_and_ntnc_ca <- cws_and_ntnc %>% 
+  filter(primacy_agency_code == "CA")
+nrow(cws_and_ntnc_ca) # 8613, good 
+
+# save for next step
+saveRDS(cws_and_ntnc_ca, "intermediate_data/cws_and_ntnc_ca.rds")
+
+## are we overlooking any systems based on missing or incorrect data?
+# look at na's
+count_df_na(cws_and_ntnc_ca)
+nrow(cws_and_ntnc_ca)
+
+# look at date
+min(cws_and_ntnc_ca$first_reported_date_2, na.rm = TRUE) # 1979
+max(cws_and_ntnc_ca$first_reported_date_2, na.rm = TRUE) # 2024
+min(cws_and_ntnc_ca$pws_deactivation_date_2, na.rm = TRUE) # 1980
+max(cws_and_ntnc_ca$pws_deactivation_date_2, na.rm = TRUE) # 2024
+
+# add variable for time bw first reported and deactivated date
+cws_and_ntnc_time <- cws_and_ntnc_ca %>% 
+  mutate(time_open = pws_deactivation_date_2 - first_reported_date_2)
+
+# how many have dates that indicate a negative time open?
+cws_and_ntnc_time %>% filter(time_open < 0) %>% nrow() # 107 systems
+nrow(cws_and_ntnc_time) # 8613
+107/8613
+
+# simplify to check those systems
+ca_sm <- cws_and_ntnc_time %>% 
+  dplyr::select(pwsid,
+                #first_reported_date,
+                first_reported_date_2,
+                #pws_deactivation_date,
+                pws_deactivation_date_2,
+                time_open,
+                pws_activity_code, 
+                pws_type_code,
+                pws_name)
+chk_time_open <- ca_sm %>% filter(time_open < 0) 
+table(chk_time_open$pws_activity_code) # they're all inactive or N (changed), 
+  # so will be excluded anyway
+    # for reference:
+    # A - Active
+    # I - Inactive
+    # N - Changed from public to non-public
+    # M - Merged with another system
+    # P - Potential future system to be regulated
+
+# how many systems are new after 01-01-2020?
+cws_and_ntnc_time %>% filter(first_reported_date_2 >= "2020-01-01") %>% nrow()
+  # 87
+chk_recent <- cws_and_ntnc_time %>% filter(first_reported_date_2 >= "2020-01-01") 
+
+table(chk_recent$pws_activity_code) # 67 active
+
+
+## filtering by date and activity code
+# filter for systems active during our time frame
+active_cws_ntnc <- cws_and_ntnc_time %>% 
+  # active as of Q4-2024
+  filter(pws_activity_code == "A") 
+# how many unique systems?
+nrow(active_cws_ntnc) # 4301
+
+# check for recently closed systems just to note it
+recently_closed <- cws_and_ntnc_time %>% 
+  #  deactivation date after 2020 (i.e. they were open for part of 2020-2024)
+  filter(pws_deactivation_date_2 >= "2020-01-01")
+table(recently_closed$pws_activity_code)
+  # 63 inactive, 159 changed from public to non-public
+
+# do any of the systems in this dataset have a negative 'time open'?
+negative_time <- active_cws_ntnc %>% 
+  filter(time_open < 1) %>% nrow() # 0, so no
+
+# how many were open for less than 1 year?
+one_year <- active_cws_ntnc %>% 
+  filter(time_open < 365 & time_open >= 1) %>% 
+  dplyr::select(pwsid,
+                #first_reported_date,
+                first_reported_date_2,
+                #pws_deactivation_date,
+                pws_deactivation_date_2,
+                time_open,
+                pws_activity_code, 
+                pws_type_code,
+                pws_name)
+nrow(one_year) # 0, none were open for less than a year
+
+# rename for ease
+active_cws_ntnc_echo <- active_cws_ntnc %>% 
+  # add _echo to all variables so i know which dataset each variable comes from
+  rename_with(~ paste(., "echo", sep= "_"))
+nrow(active_cws_ntnc_echo) # 4301
+
+###
+# check that all carceral systems are in this list
+###
+
+chk_all_here <- as.data.frame(carceral_sys_ids) %>% 
+  filter(carceral_sys_ids %notin% active_cws_ntnc_echo$pwsid_echo)
+nrow(chk_all_here) # 0, good!
+
+# check the inverse just in case
+active_cws_ntnc_echo %>% 
+  filter(pwsid_echo %in% carceral_sys_ids) %>% nrow() # 207
+length(carceral_sys_ids) # 207, good
+
+
+###
+# identify water system within carceral typology
+###
+
+typology <- active_cws_ntnc_echo %>% 
+  mutate(carceral_sys = 
+           ifelse(pwsid_echo %in% cws_list_exclusive_carceral_final$pwsid, 
+                  "carceral_water_system",
+                  ifelse(pwsid_echo %in%
+                           pws_carceral_nonexclusive_final_ids$pwsid, 
+                         "carceral_serving_water_system",
+                         "other_water_systems")))
+
+table(typology$carceral_sys)
+
+# save the universe of pwsids
+universe_pwsids <- typology$pwsid_echo
+
+
+###
+# save
+###
+
+saveRDS(typology, "processed_data/typology.rds")
+dim(typology) # 4301   55
+
+saveRDS(active_cws_ntnc_echo, "processed_data/active_cws_ntnc_echo.rds")
+dim(active_cws_ntnc_echo) # 4301   54
+
+saveRDS(universe_pwsids, "processed_data/universe_pwsids.rds")
+
+```
+
+# step 3: make tables S1 and S2
+```{r}
+### 
+# load
+### 
+
+# load carceral facilities & associated pwsids (noting that this list does not 
+# adjust for several that we manually corrected later outside of this workflow,
+# so some additional manual edits happen below)
+all_prisons_w_pwsid_status <- readRDS("processed_data/all_prisons_w_pwsid_status.rds")
+
+# load USEPA list of all water systems for water system info (address, city)
+cws_and_ntnc_ca <- readRDS("intermediate_data/cws_and_ntnc_ca.rds")
+
+# full prisons data - to include address/city
+prisons_ca_flat <- readRDS("processed_data/prisons_ca_flat.rds")
+
+
+### 
+# simplify
+###
+
+all_prisons_w_pwsid_status_s <- all_prisons_w_pwsid_status %>% 
+  # remove unneeded column (it wasn't a spatial object anyways)
+  dplyr::select(-geometry)
+
+cws_and_ntnc_ca_s <- cws_and_ntnc_ca %>% 
+  dplyr::select(pwsid, pws_name, address_line1,
+                address_line2, city_name, zip_code)
+
+prisons_ca_flat_s <- prisons_ca_flat %>% 
+  dplyr::select(facilityid, name, type, 
+                address, city, state, zip, 
+                county)
+
+###
+# make manual update (to parallel what's above)
+###
+
+# manually change facilityid 10005329 and 10005330 to CWS CA3600215, based
+# on Dryad/KBD list and manual review
+all_prisons_w_pwsid_status_s$PWSID[all_prisons_w_pwsid_status_s$facilityid=="10005329"] <- "CA3600215"
+all_prisons_w_pwsid_status_s$match_method[all_prisons_w_pwsid_status_s$facilityid=="10005329"] <- "subsequent_manual_assign"
+
+all_prisons_w_pwsid_status_s$PWSID[all_prisons_w_pwsid_status_s$facilityid=="10005330"] <- "CA3600215"
+all_prisons_w_pwsid_status_s$match_method[all_prisons_w_pwsid_status_s$facilityid=="10005330"] <- "subsequent_manual_assign"
+  
+# manually remove a facility that had closed and was removed earlier 
+# (with PWS as unit of analysis)
+# but leftover in the version with facility as unit of observation
+all_prisons_w_pwsid_status_s <- all_prisons_w_pwsid_status_s %>% 
+  filter(facility_name != "LOS PRIETOS BOYS CAMP") %>% 
+  filter(facility_name != "VALLEY VIEW CONSERVATION CAMP #34")
+
+nrow(all_prisons_w_pwsid_status) # 347
+nrow(all_prisons_w_pwsid_status_s) # 345, good
+
+
+###
+# join
+###
+
+# with facility as unit of observation, add additional info
+all_prisons_w_pwsid_details <- all_prisons_w_pwsid_status_s %>% 
+  # add pws address/city
+  left_join(cws_and_ntnc_ca_s, by = c("PWSID" = "pwsid")) %>% 
+  # add facility address/city
+  left_join(prisons_ca_flat_s, by = ("facilityid"))
+
+# double check
+identical(all_prisons_w_pwsid_details$facility_name,
+          all_prisons_w_pwsid_details$name) # true
+nrow(all_prisons_w_pwsid_details) # 345, good
+
+# select appropriate columns
+final_list_tbl_s2 <- all_prisons_w_pwsid_details %>% 
+  dplyr::select(-name) %>% 
+  relocate(facility_name, facilityid, type, address, city, state, zip, county,
+           match_method, PWSID, pws_name, address_line1, address_line2, 
+           city_name, zip_code) %>% 
+  rename(pwsid = PWSID)
+
+
+# rename
+tbl_s2 <- final_list_tbl_s2 %>% 
+  dplyr::select(-state) %>% 
+  # rename
+  rename(facility_address = address,
+         facility_city = city,
+         facility_zip = zip,
+         facility_county=county,
+         pws_address_line1 = address_line1,
+         pws_address_line2 = address_line2,
+         pws_city = city_name,
+         pws_zip = zip_code,
+         match_method_wo_dryad = match_method)
+
+# simpler version
+tbl_s2_simple <- tbl_s2 %>% 
+  dplyr::select(facility_name, type, facility_county, pwsid, pws_name)
+  
+# dbl chk
+tbl_s2 %>% distinct(pws_name) %>% nrow()
+# 208 bc one is NA, good
+
+tbl_s2 %>% distinct(pwsid) %>% nrow()
+# 208 bc one is NA, good
+
+nrow(tbl_s2_simple) # 345 facilities, good
+
+
+###
+# last check in GIS software
+###
+
+# load initial list of all carceral facilities
+prisons_ca <- readRDS("processed_data/prisons_ca.rds")
+nrow(prisons_ca) # 357
+
+# pull spatial info
+prisons_sf <- prisons_ca %>% 
+  dplyr::select(facilityid)
+
+# join
+prisons_sf_w_pwsid <- prisons_sf %>% 
+  left_join(tbl_s2, by = "facilityid") 
+
+# add a flag if city names are not the same
+prisons_sf_w_pwsid2 <- prisons_sf_w_pwsid %>% 
+  mutate(city_same = ifelse(facility_city == pws_city, "same_city", "different_city"))
+
+table(prisons_sf_w_pwsid2$city_same) # 82 have a different city listed
+
+prisons_diff_city <- prisons_sf_w_pwsid2 %>% 
+  filter(city_same == "different_city")
+
+# save as shapefile
+st_write(prisons_sf_w_pwsid, "intermediate_data/prisons_sf_w_pwsid.shp", delete_layer = TRUE)
+  nrow(prisons_sf_w_pwsid) # 357
+st_write(prisons_diff_city, "intermediate_data/diff_city.shp", delete_layer = TRUE)
+  nrow(prisons_diff_city) # 82
+  
+# view on map to check that different cities look okay
+#  mapview(prisons_diff_city,
+#          zcol = "pws_name",
+#          col.regions = "red", col = "red") +
+#    mapview(ca_sabl, 
+#            zcol= "WATER_SYSTEM_NAME",
+#            col.regions = "lightblue", col = "black", legend = FALSE)
+  
+  # The different city names seem to have to do with the city listed in USEPA
+  # data being perhaps a mailing/office address, and the city listed in 
+  # the carceral facility data being more of a physical location address.
+  # The SABL city names seem to line up better with the city names listed in the
+  # carceral facilities dataset (from a quick check).
+  
+# check one with note in Dryad list
+#  mapview(prisons_sf_w_pwsid2[prisons_sf_w_pwsid2$facility_name=="ADELANTO ICE PROCESSING CENTER",],
+#          zcol = "pws_name",
+#          col.regions = "red", col = "red") +
+#    mapview(ca_sabl, 
+#            zcol= "WATER_SYSTEM_NAME",
+#            col.regions = "lightblue", col = "black", legend = FALSE)
+  
+#mapview(prisons_sf_w_pwsid2[prisons_sf_w_pwsid2$facility_name=="DESERT VIEW ANNEX",],
+#        zcol = "pws_name",
+#        col.regions = "red", col = "red") +
+#  mapview(ca_sabl, 
+#          zcol= "WATER_SYSTEM_NAME",
+#          col.regions = "lightblue", col = "black", legend = FALSE)
+
+# check one more with medium confidence from nomatch list
+  # check one with note in Dryad list
+#  mapview(prisons_sf_w_pwsid2[prisons_sf_w_pwsid2$facility_name=="VENTURA COUNTY EAST COUNTY JAIL",],
+#          zcol = "pws_name",
+#          col.regions = "red", col = "red") +
+#    mapview(ca_sabl, 
+#            zcol= "WATER_SYSTEM_NAME",
+#            col.regions = "lightblue", col = "black", legend = FALSE)
+
+###
+# check closed facilities to make Table S1
+###
+
+# load initial list of all carceral facilities
+prisons_ca <- readRDS("processed_data/prisons_ca.rds")
+nrow(prisons_ca) # 357
+
+# closed facilities - excel created by team based on internet research
+st_fed_closures <- read_xlsx("intermediate_data/updated_HIFLD_list_with_closures.xlsx")
+nrow(st_fed_closures) # 9
+
+st_fed_closures_ids <- st_fed_closures %>% 
+  # select only key info
+  dplyr::select(FACILITYID) %>% 
+  mutate(facilityid = as.character(FACILITYID)) %>% 
+  dplyr::select(facilityid)
+
+# manually add others identified subsequently as closed
+other_closures_ids <- prisons_ca %>% 
+  filter(facilityid %in% c("10006705", # carl f bryan
+                    "10006710", # los prietos
+                    "10005275")) %>% # valley view - state; ID'd after initial list
+  # select only key info
+  dplyr::select(facilityid) 
+  
+all_closures <- st_fed_closures_ids %>% 
+  bind_rows(other_closures_ids)
+
+# pull other info for Table S1
+all_closures_w_type_county <- all_closures %>% 
+  left_join(prisons_ca, by = "facilityid") %>% 
+  dplyr::select(name, type, county)
+
+# check full list
+all_open_in_analysis <- final_list_tbl_s2 %>% 
+  dplyr::select(facilityid)
+
+# bind rows
+all_facilities_chk <- all_open_in_analysis %>% 
+  bind_rows(all_closures)
+
+# chk if any duplicates
+all_facilities_chk %>% 
+  group_by(facilityid) %>% 
+  filter(n() >1) # 0, good no duplicates
+
+nrow(all_facilities_chk) # 357, great! lines up
+
+# check if all there
+prisons_ca %>% 
+  filter(facilityid %in% all_facilities_chk$facilityid) %>% nrow() # 357
+
+# and inverse
+prisons_ca %>% 
+  filter(!facilityid %in% all_facilities_chk$facilityid) %>% nrow()# 0, good
+
+
+###
+# save
+###
+
+# final Table S2 with initial variable names
+saveRDS(final_list_tbl_s2, "processed_data/final_list_tbl_s2.rds")
+
+# final Table S2 with clearer variable names
+write_csv(tbl_s2, "outputs/tbl_s2.csv")
+saveRDS(tbl_s2, "outputs/tbl_s2.rds")
+
+# final Table S2with key variables only
+write_csv(tbl_s2_simple, "outputs/tbl_s2_simple.csv")
+saveRDS(tbl_s2_simple, "outputs/tbl_s2_simple.rds")
+
+# Table S1
+saveRDS(all_closures_w_type_county, "outputs/all_closures_w_type_county.rds")
+write_csv(all_closures_w_type_county, "outputs/all_closures_w_type_county.csv")
+
+```
